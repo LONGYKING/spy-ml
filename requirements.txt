@@ -1,7 +1,7 @@
-fastapi
-uvicorn[standard]
-insightface
-onnxruntime
-opencv-python-headless
-numpy
-httpx
+fastapi==0.129.0
+uvicorn[standard]==0.40.0
+insightface==0.7.3
+onnxruntime==1.23.2
+opencv-python-headless==4.13.0.92
+numpy==2.4.2
+httpx==0.28.1
