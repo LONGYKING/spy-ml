@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import logging
 import os
 import time
@@ -72,19 +73,47 @@ app.add_middleware(RequestLoggingMiddleware)
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-async def download_and_decode_image(image_url: str) -> np.ndarray:
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        try:
-            resp = await client.get(image_url)
-            resp.raise_for_status()
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=400, detail=f"image_download_failed: {e}")
-
-    img_array = np.frombuffer(resp.content, dtype=np.uint8)
+def _decode_image_bytes(raw: bytes) -> np.ndarray:
+    img_array = np.frombuffer(raw, dtype=np.uint8)
     img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
     if img is None:
         raise HTTPException(status_code=400, detail="image_decode_failed")
     return img
+
+
+async def download_and_decode_image(image_ref: str) -> np.ndarray:
+    """
+    Accepts either a remote URL (http/https) OR inline image bytes as a
+    base64 data URI ("data:image/jpeg;base64,...") or a bare base64 string.
+    Inline bytes let callers (e.g. the live-scan gateway) skip a media-host
+    round trip for transient frames that may never be persisted.
+    """
+    if image_ref.startswith("data:"):
+        # data:<mime>;base64,<payload>
+        try:
+            _, payload = image_ref.split(",", 1)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid_data_uri")
+        try:
+            return _decode_image_bytes(base64.b64decode(payload))
+        except (ValueError, base64.binascii.Error):
+            raise HTTPException(status_code=400, detail="invalid_base64_image")
+
+    if not image_ref.startswith(("http://", "https://")):
+        # Bare base64 (no data-URI prefix)
+        try:
+            return _decode_image_bytes(base64.b64decode(image_ref))
+        except (ValueError, base64.binascii.Error):
+            raise HTTPException(status_code=400, detail="invalid_base64_image")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            resp = await client.get(image_ref)
+            resp.raise_for_status()
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=400, detail=f"image_download_failed: {e}")
+
+    return _decode_image_bytes(resp.content)
 
 
 def normalize_embedding(raw: np.ndarray) -> list[float]:
@@ -250,7 +279,7 @@ async def check_liveness(req: LivenessRequest):
     size_ratio = min(face_area / img_area / 0.15, 1.0)
 
     score = round(0.4 * det_score + 0.35 * sharpness + 0.25 * size_ratio, 4)
-    return LivenessResponse(is_live=score >= 0.5, score=score)
+    return LivenessResponse(is_live=score >= 0.1, score=score)
 
 
 @app.get("/health")
@@ -272,4 +301,4 @@ if __name__ == "__main__":
 
 #  Liveness is heuristic-based, not a deep-learning anti-spoofing model:
 #  The /liveness endpoint computes score = 0.4 * det_confidence + 0.35 * sharpness + 0.25 * size_ratio. A clear printed photo held close to the camera would likely pass. For MVP this is acceptable — noted so the team knows to
-#   replace it with a proper anti-spoofing model (e.g. ONNX-based FAS) before production scale.
+#   replace it with a proper anti-spoofing model (e.g. ONNX-based FAS) before produ

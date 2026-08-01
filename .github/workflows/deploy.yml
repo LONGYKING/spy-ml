@@ -1,0 +1,65 @@
+name: Deploy ML service
+
+# Redeploys spy-ml (FastAPI + InsightFace) to the Hetzner box on push to main.
+# The service is internal-only (no public port), so the health check runs on the
+# server against the container's own port.
+#
+# NOTE ON ORDERING: when a change spans BOTH services (e.g. the inline-base64
+# scan contract), merge/deploy spy-ml FIRST, let it go green, then deploy spy-be.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-ml
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25   # first image build downloads the InsightFace model
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -p "${{ secrets.SSH_PORT || 22 }}" -H "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Sync source to server
+        run: |
+          rsync -az --delete \
+            --exclude '.git' --exclude '__pycache__' --exclude '.venv' \
+            -e "ssh -p ${{ secrets.SSH_PORT || 22 }} -i ~/.ssh/id_deploy" \
+            ./ "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:faciey/spy-ml/"
+
+      - name: Build & restart ML
+        run: |
+          ssh -p "${{ secrets.SSH_PORT || 22 }}" -i ~/.ssh/id_deploy \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" bash -euo pipefail <<'EOF'
+          cd "$HOME/faciey"
+          docker compose -f docker-compose.prod.yml build spy-ml
+          docker compose -f docker-compose.prod.yml up -d spy-ml
+          docker image prune -f >/dev/null 2>&1 || true
+          EOF
+
+      - name: Health check (internal)
+        run: |
+          ssh -p "${{ secrets.SSH_PORT || 22 }}" -i ~/.ssh/id_deploy \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" bash -euo pipefail <<'EOF'
+          cd "$HOME/faciey"
+          for i in $(seq 1 18); do
+            if docker compose -f docker-compose.prod.yml exec -T spy-ml \
+                 python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" 2>/dev/null; then
+              echo "✅ ML healthy"; exit 0
+            fi
+            echo "waiting for ML... ($i/18)"; sleep 5
+          done
+          echo "❌ ML health check failed — recent logs:"
+          docker compose -f docker-compose.prod.yml logs --tail=60 spy-ml
+          exit 1
+          EOF
