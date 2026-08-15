@@ -27,6 +27,24 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25   # a cold image build re-downloads the InsightFace model
     steps:
+      - name: Check required secrets
+        run: |
+          # Without this, a missing secret interpolates to an empty string and
+          # surfaces twenty lines later as "Could not resolve hostname :" —
+          # which reads like a DNS fault rather than an unset variable.
+          # GitHub secrets are PER-REPOSITORY; adding them to the other repo
+          # does not carry over.
+          missing=""
+          [ -n "${{ secrets.SSH_HOST }}" ]        || missing="$missing SSH_HOST"
+          [ -n "${{ secrets.SSH_KEY }}" ]         || missing="$missing SSH_KEY"
+          [ -n "${{ secrets.SSH_KNOWN_HOSTS }}" ] || missing="$missing SSH_KNOWN_HOSTS"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing"
+            echo "Add them at Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          echo "required secrets present"
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
