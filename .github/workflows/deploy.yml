@@ -1,11 +1,17 @@
-name: Deploy ML service
+name: Deploy ML service to production
 
-# Redeploys spy-ml (FastAPI + InsightFace) to the Hetzner box on push to main.
-# The service is internal-only (no public port), so the health check runs on the
-# server against the container's own port.
+# main -> production (Hetzner). The service is internal-only — no public port,
+# no DNS record — so the health gate runs on the server, inside ci-deploy.sh,
+# against the container's own healthcheck.
 #
-# NOTE ON ORDERING: when a change spans BOTH services (e.g. the inline-base64
-# scan contract), merge/deploy spy-ml FIRST, let it go green, then deploy spy-be.
+# ORDERING: when a change spans BOTH services (e.g. the inline-base64 scan
+# contract), deploy spy-ml FIRST, let it go green, then deploy spy-be. The
+# backend tolerates an ML service that is ahead of it; the reverse is not true.
+#
+# Like the backend workflow, this copies nothing and runs no commands on the
+# server. The SSH key is pinned by a forced `command=` to ~/faciey/ci-deploy.sh,
+# so the only thing this workflow can express is "redeploy spy-ml". The server
+# pulls origin/main itself.
 
 on:
   push:
@@ -13,53 +19,26 @@ on:
   workflow_dispatch: {}
 
 concurrency:
-  group: deploy-ml
+  group: deploy-ml-prod
   cancel-in-progress: false
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 25   # first image build downloads the InsightFace model
+    timeout-minutes: 25   # a cold image build re-downloads the InsightFace model
     steps:
-      - uses: actions/checkout@v4
-
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.SSH_KEY }}" > ~/.ssh/id_deploy
           chmod 600 ~/.ssh/id_deploy
-          ssh-keyscan -p "${{ secrets.SSH_PORT || 22 }}" -H "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+          # Pinned from a secret rather than ssh-keyscan at runtime, which would
+          # trust whatever host happens to answer.
+          printf '%s\n' "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
 
-      - name: Sync source to server
+      - name: Deploy
         run: |
-          rsync -az --delete \
-            --exclude '.git' --exclude '__pycache__' --exclude '.venv' \
-            -e "ssh -p ${{ secrets.SSH_PORT || 22 }} -i ~/.ssh/id_deploy" \
-            ./ "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:faciey/spy-ml/"
-
-      - name: Build & restart ML
-        run: |
-          ssh -p "${{ secrets.SSH_PORT || 22 }}" -i ~/.ssh/id_deploy \
-            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" bash -euo pipefail <<'EOF'
-          cd "$HOME/faciey"
-          docker compose -f docker-compose.prod.yml build spy-ml
-          docker compose -f docker-compose.prod.yml up -d spy-ml
-          docker image prune -f >/dev/null 2>&1 || true
-          EOF
-
-      - name: Health check (internal)
-        run: |
-          ssh -p "${{ secrets.SSH_PORT || 22 }}" -i ~/.ssh/id_deploy \
-            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" bash -euo pipefail <<'EOF'
-          cd "$HOME/faciey"
-          for i in $(seq 1 18); do
-            if docker compose -f docker-compose.prod.yml exec -T spy-ml \
-                 python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" 2>/dev/null; then
-              echo "✅ ML healthy"; exit 0
-            fi
-            echo "waiting for ML... ($i/18)"; sleep 5
-          done
-          echo "❌ ML health check failed — recent logs:"
-          docker compose -f docker-compose.prod.yml logs --tail=60 spy-ml
-          exit 1
-          EOF
+          ssh -i ~/.ssh/id_deploy \
+              -o IdentitiesOnly=yes \
+              deploy@"${{ secrets.SSH_HOST }}" spy-ml
